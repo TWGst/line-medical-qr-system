@@ -1,36 +1,75 @@
 import os
-from dotenv import load_dotenv
-from flask import Flask, request, abort
+import re
+import time
+import threading
+from datetime import datetime
+from flask import Flask, request, abort, current_app, send_from_directory
+from flask import copy_current_request_context
 from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (MessageEvent, TextMessage, TextSendMessage, 
                             QuickReplyButton, QuickReply, ImageSendMessage)
 from flask_cors import CORS
 import qrcode
-import io
-import base64
-from datetime import datetime
-import re
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
 
 app = Flask(__name__)
 CORS(app)
+    
+# 環境変数の読み込み
+from dotenv import load_dotenv
 load_dotenv()
 
+# LINE Bot API の設定
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.getenv('LINE_CHANNEL_SECRET'))
 
+# アプリケーションの設定
+app.config['UPLOAD_FOLDER'] = 'static/qr_codes'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# グローバル変数
 user_states = {}
 user_data = {}
 
-def generate_qr_code(data):
+def generate_qr_code(data, user_id):
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
     qr.add_data(data)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    img_byte_arr = io.BytesIO()
-    img.save(img_byte_arr, format='PNG')
-    img_byte_arr = img_byte_arr.getvalue()
-    return base64.b64encode(img_byte_arr).decode()
+    
+    filename = f"qr_{user_id}_{int(time.time())}.png"
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(filename))
+    img.save(filepath)
+    
+    return filename
+    
+def send_qr_code(user_id, qr_data):
+    @copy_current_request_context
+    def _send_qr_code(user_id, qr_data):
+        try:
+            filename = generate_qr_code(qr_data, user_id)
+            if filename:
+                host = request.host_url.rstrip('/')
+                qr_url = f"{host}/static/qr_codes/{filename}"
+                message = [
+                    TextSendMessage(text="診察券の登録が完了しました。以下のQRコードを保存してください。"),
+                    ImageSendMessage(
+                        original_content_url=qr_url,
+                        preview_image_url=qr_url
+                    )
+                ]
+                line_bot_api.push_message(user_id, message)
+                current_app.logger.info(f"QRコードを送信しました: {user_id}")
+            else:
+                line_bot_api.push_message(user_id, TextSendMessage(text="QRコードの生成に失敗しました。"))
+        except LineBotApiError as e:
+            current_app.logger.error(f"LINE API エラー: {str(e)}")
+        except Exception as e:
+            current_app.logger.error(f"QRコード送信エラー: {str(e)}")
+
+    threading.Thread(target=_send_qr_code, args=(user_id, qr_data)).start()
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -117,21 +156,25 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, message)
                 return
 
-            del user_states[user_id]
             qr_data = f"Card Number: {user_data[user_id]['card_number']}, Name: {user_data[user_id]['name']}, Name (Kana): {user_data[user_id]['name_kana']}, Birthdate: {user_data[user_id]['birthdate']}, Gender: {user_data[user_id]['gender']}, Postal Code: {user_data[user_id]['postal_code']}, Phone: {user_data[user_id]['phone']}, Email: {user_data[user_id]['email']}"
-            qr_image = generate_qr_code(qr_data)
-            message = [
-                TextSendMessage(text="診察券の登録が完了しました。以下のQRコードを保存してください。"),
-                ImageSendMessage(
-                    original_content_url=f"data:image/png;base64,{qr_image}",
-                    preview_image_url=f"data:image/png;base64,{qr_image}"
-                )
-            ]
+            send_qr_code(user_id, qr_data)
+            
+            message = TextSendMessage(text="診察券の登録が完了しました。まもなくQRコードが送信されます。")
+            del user_states[user_id]
     
     else:
         message = TextSendMessage(text="「診察券」と入力して、診察券の登録を開始してください。")
 
     line_bot_api.reply_message(event.reply_token, message)
 
+@app.route('/')
+def index():
+    return "LINE診察券システムが正常に動作しています。"
+
+@app.route('/static/<path:path>')
+def send_static(path):
+    return send_from_directory('static', path)
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, ssl_context='adhoc')
