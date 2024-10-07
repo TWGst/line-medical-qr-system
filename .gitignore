@@ -2,3 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .env
+# Google Cloud Platform credentials
+**/secure_keys/
+*.json

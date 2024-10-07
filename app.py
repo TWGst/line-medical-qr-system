@@ -3,8 +3,10 @@ import re
 import time
 import threading
 import logging
+import sys
+import io
 from datetime import datetime
-from flask import Flask, jsonify, request, abort, current_app, send_from_directory, url_for
+from flask import Flask, render_template, jsonify, request, abort, current_app, send_from_directory, url_for
 from flask import copy_current_request_context
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
@@ -15,6 +17,9 @@ from werkzeug.utils import secure_filename
 from werkzeug.middleware.shared_data import SharedDataMiddleware
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # ログ設定
 logging.basicConfig(level=logging.DEBUG)
@@ -45,6 +50,7 @@ app.logger.info(f"UPLOAD_FOLDER path: {app.config['UPLOAD_FOLDER']}")
 
 # スプレッドシートのJSONキー
 credentials_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+
 # Google Sheets APIの設定
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
 creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
@@ -52,6 +58,17 @@ client = gspread.authorize(creds)
 
 # スプレッドシートを開く
 sheet = client.open(os.getenv('SPREADSHEET_NAME')).sheet1
+# UTF-8エンコーディングを設定
+sheet.client.session.encoding = 'utf-8'
+
+# スプレッドシートの列見出しを更新
+headers = ['Timestamp', 'Card Number', 'Name', 'Name (Kana)', 'Birthdate', 'Gender', 'Postal Code', 'Phone', 'Email']
+try:
+    if sheet.row_values(1) != headers:
+        sheet.insert_row(headers, 1)
+        app.logger.info("Spreadsheet headers updated")
+except Exception as e:
+    app.logger.error(f"Failed to update spreadsheet headers: {str(e)}")
 
 # LINE Bot API の設定
 line_bot_api = LineBotApi(os.getenv('LINE_CHANNEL_ACCESS_TOKEN'))
@@ -75,21 +92,23 @@ def log_response_info(response):
         app.logger.debug('Response: [Binary data]')
     return response
 
-
-
 def generate_qr_code(data, user_id):
-    qr = qrcode.QRCode(version=1, box_size=10, border=5)
-    qr.add_data(data)
-    qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white")
-    
-    filename = f"qr_{user_id}_{int(time.time())}.png"
-    filepath = os.path.join(static_qr_folder, filename)
-    img.save(filepath)
+    try:
+        qr = qrcode.QRCode(version=1, box_size=10, border=5)
+        qr.add_data(data.decode('utf-8') if isinstance(data, bytes) else data)  # バイト列の場合はデコード
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        
+        filename = f"qr_{user_id}_{int(time.time())}.png"
+        filepath = os.path.join(static_qr_folder, filename)
+        img.save(filepath)
 
-    app.logger.info(f"QR code generated and saved: {filepath}")
-    app.logger.info(f"File exists: {os.path.exists(filepath)}")
-    return filename
+        app.logger.info(f"QR code generated and saved: {filepath}")
+        app.logger.info(f"File exists: {os.path.exists(filepath)}")
+        return filename
+    except Exception as e:
+        app.logger.error(f"Error generating QR code: {str(e)}", exc_info=True)
+        return None
 
 def send_qr_code(user_id, qr_data):
     @copy_current_request_context
@@ -113,12 +132,14 @@ def send_qr_code(user_id, qr_data):
         except LineBotApiError as e:
             current_app.logger.error(f"LINE API エラー: {str(e)}")
         except Exception as e:
-            current_app.logger.error(f"QRコード送信エラー: {str(e)}")
+            current_app.logger.error(f"QRコード送信エラー: {str(e)}", exc_info=True)
 
     threading.Thread(target=_send_qr_code, args=(user_id, qr_data)).start()
 
 def update_spreadsheet(user_data):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # タイムスタンプを生成
     row = [
+        timestamp,  # タイムスタンプを最初の列に追加
         user_data.get('Card Number', ''),
         user_data.get('Name', ''),
         user_data.get('Name (Kana)', ''),
@@ -128,7 +149,10 @@ def update_spreadsheet(user_data):
         user_data.get('Phone', ''),
         user_data.get('Email', '')
     ]
+    # Unicode文字列に変換
+    row = [str(item) for item in row]
     sheet.append_row(row)
+    app.logger.info(f"Data added to spreadsheet: {row}")  # ログ追加
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -150,6 +174,8 @@ def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text
     app.logger.info(f"Received message from {user_id}: {text}")
+
+    message = None  # Initialize message variable
 
     if text == "診察券":
         user_states[user_id] = "waiting_card_number"
@@ -191,7 +217,7 @@ def handle_message(event):
                     raise ValueError("Invalid date format")
             except ValueError:
                 message = TextSendMessage(text="無効な日付形式です。YYYY年MM月DD日の形式で入力してください。（例：1990年01月01日）")  
- 
+
         elif user_states[user_id] == "waiting_gender":
             if text in ["男性", "女性"]:
                 user_data[user_id]["gender"] = text
@@ -226,17 +252,32 @@ def handle_message(event):
                 line_bot_api.reply_message(event.reply_token, message)
                 return
 
-            qr_data = f"Card Number: {user_data[user_id]['card_number']}, Name: {user_data[user_id]['name']}, Name (Kana): {user_data[user_id]['name_kana']}, Birthdate: {user_data[user_id]['birthdate']}, Gender: {user_data[user_id]['gender']}, Postal Code: {user_data[user_id]['postal_code']}, Phone: {user_data[user_id]['phone']}, Email: {user_data[user_id]['email']}"
+            qr_data = (f"Card Number: {user_data[user_id]['card_number']}, "
+                        f"Name: {user_data[user_id]['name']}, "
+                        f"Name (Kana): {user_data[user_id]['name_kana']}, "
+                        f"Birthdate: {user_data[user_id]['birthdate']}, "
+                        f"Gender: {user_data[user_id]['gender']}, "
+                        f"Postal Code: {user_data[user_id]['postal_code']}, "
+                        f"Phone: {user_data[user_id]['phone']}, "
+                        f"Email: {user_data[user_id]['email']}")
+            qr_data = qr_data.encode('utf-8')  # UTF-8エンコーディングを確保
             send_qr_code(user_id, qr_data)
             
             message = TextSendMessage(text="診察券の登録が完了しました。まもなくQRコードが送信されます。")
             del user_states[user_id]
             
-        else:
-            message = TextSendMessage(text="「診察券」と入力して、診察券の登録を開始してください。")
+    else:
+        message = TextSendMessage(text="「診察券」と入力して、診察券の登録を開始してください。")
 
-    line_bot_api.reply_message(event.reply_token, message)
-    app.logger.info(f"Sent reply to {user_id}: {message}")
+    if message:
+        line_bot_api.reply_message(event.reply_token, message)
+        app.logger.info(f"Sent reply to {user_id}: {message}")
+    else:
+        app.logger.warning(f"No message to send for user {user_id}")
+
+@app.route('/camera')
+def camera():
+    return render_template('camera.html')
 
 @app.route('/scan_qr', methods=['POST'])
 def scan_qr():
@@ -247,20 +288,34 @@ def scan_qr():
         return jsonify({"error": "QR data is missing"}), 400
     
     # QRコードデータの解析
-    info = dict(item.split(": ") for item in qr_data.split(", "))
+    info = {}
+    for item in qr_data.split(", "):
+        key, value = item.split(": ", 1)
+        info[key] = value.encode('iso-8859-1').decode('utf-8')  # エンコーディングの修正
     
     # スプレッドシートに登録
     try:
         update_spreadsheet(info)
-        return jsonify({"message": "Data registered successfully"}), 200
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        app.logger.info(f"QR code scanned and data registered at {timestamp}")
+        return jsonify({"message": f"データが正常に登録されました。スキャン時刻: {timestamp}"}), 200
     except Exception as e:
         app.logger.error(f"Failed to update spreadsheet: {str(e)}")
-        return jsonify({"error": "Failed to register data"}), 500
+        return jsonify({"error": "データの登録に失敗しました"}), 500
 
 @app.route('/')
 def index():
-    app.logger.info("Root path accessed")
-    return "LINE診察券システムが正常に動作しています。"
+    camera_url = url_for('camera', _external=True)
+    # スプレッドシートにカメラページのURLを追加
+    try:
+        sheet = client.open(os.getenv('SPREADSHEET_NAME')).worksheet('カメラ起動')
+        sheet.update('A1', 'カメラ起動URL')
+        sheet.update('B1', camera_url)
+    except Exception as e:
+        app.logger.error(f"Failed to update spreadsheet with camera URL: {str(e)}")
+    
+    app.logger.debug(f"Camera URL: {camera_url}")  # デバッグ用ログ
+    return render_template('index.html', camera_url=camera_url)
 
 @app.route('/static/<path:filename>')
 def send_static(filename):
